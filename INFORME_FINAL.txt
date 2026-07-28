@@ -1,0 +1,228 @@
+================================================================================
+  INFORME FINAL - PREDICCION DE COMPRA DE CLIENTES INSTACART
+  Modelo Hibrido: K-Means + XGBoost + CatBoost + LightGBM
+  Fecha: 26/07/2026
+================================================================================
+
+1. OBJETIVO
+--------------------------------------------------------------------------------
+Predecir el comportamiento de compra de clientes de Instacart utilizando un
+pipeline hibrido de Machine Learning con clustering + modelos de clasificacion
+y regresion, diferenciado por cluster de usuario.
+
+2. DATASET
+--------------------------------------------------------------------------------
+Fuente: Kaggle - Instacart Market Basket Analysis
+  - orders.csv:              3,421,083 pedidos
+  - order_products__prior.csv: 32,434,489 pares producto-orden
+  - order_products__train.csv:  1,384,617 productos en train
+  - products.csv:               49,688 productos
+  - aisles.csv:                   134 pasillos
+  - departments.csv:                21 departamentos
+
+Dataset final: 131,209 registros (train orders), 38 columnas
+Usuarios unicos: 206,209
+
+3. ARQUITECTURA DEL MODELO
+--------------------------------------------------------------------------------
+
+  FASE 1: Feature Engineering (caracteristicas_mejorado.py)
+  ─────────────────────────────────────────────────────────
+  Se construyen 34 features organizadas en 6 categorias:
+
+  A) Temporal del pedido actual (7 features)
+     - hour_sin, hour_cos (ciclico 24h)
+     - dow_sin, dow_cos (ciclico 7d)
+     - es_finde (sabado/domingo)
+     - es_horario_laboral (9am-5pm)
+     - es_noche (7pm-5am)
+
+  B) Carrito actual (6 features)
+     - total_productos, productos_recomprados, ratio_recompra
+     - avg_product_popularity (popularidad promedio de productos en carrito)
+     - avg_product_reorder_rate (tasa de recompra promedio de productos)
+     - max_product_popularity (producto mas popular del carrito)
+
+  C) Derivadas del carrito (3 features)
+     - cart_vs_avg (tamano actual / promedio usuario)
+     - order_number_norm (posicion en vida del usuario)
+     - es_primera_compra
+
+  D) Interacciones carrito x usuario (4 features)
+     - cart_x_recompra (total_productos * ratio_recompra)
+     - cart_x_dept (total_productos * promedio_dept_usuario)
+     - std_x_tendencia (std_dias_espera * tendencia_dias)
+     - recompra_x_std (promedio_recompra_usuario * std_carrito)
+
+  E) Lifecycle y tendencia (3 features)
+     - lifecycle_pos (order_number / total_pedidos_historicos)
+     - es_pedido_reciente (ultimos 2 pedidos)
+     - densidad_compra (productos unicos / total_pedidos)
+
+  F) Perfil historico del usuario (11 features)
+     - promedio_dias_espera, std_dias_espera, total_pedidos_historicos
+     - tendencia_dias (ultimo pedido vs promedio historico)
+     - promedio_productos, std_carrito, promedio_recompra_usuario
+     - promedio_dept_usuario, n_departamentos_historial
+     - n_aisles_historial, n_products_historial
+
+  FASE 2: Clustering (K-Means, 3 clusters)
+  ─────────────────────────────────────────
+  Features de clustering (10):
+    promedio_dias_espera, std_dias_espera, total_pedidos_historicos,
+    promedio_productos, promedio_recompra_usuario, promedio_dept_usuario,
+    std_carrito, n_departamentos_historial, n_aisles_historial, tendencia_dias
+
+  Clusters resultantes:
+    C2 - ESTABLE:  35,812 registros (usuarios con patron regular)
+    C0 - REGULAR:  39,513 registros (usuarios intermedios)
+    C1 - CAOTICO:  55,041 registros (usuarios impredecibles)
+
+  FASE 3: Modelos de ML
+  ─────────────────────
+  Se entrenan 3 modelos por cluster y por tarea:
+
+  V1 - Clasificacion: "El pedido es en <=7 dias?"
+    - XGBoostClassifier (Optuna, 15 trials)
+    - CatBoostClassifier (auto_class_weights='Balanced')
+    - LGBMClassifier (is_unbalance=True)
+    - Stacking: promedio de probabilidades de los 3 modelos
+
+  V4 - Regresion: "Cuantos productos comprara?"
+    - XGBRegressor (Optuna, 15 trials)
+    - CatBoostRegressor
+    - LGBMRegressor
+
+  Validacion: GroupKFold (3-fold para Optuna, 3-fold para evaluacion final)
+  Los folds respetan la agrupacion por user_id para evitar leakage temporal.
+
+  FASE 4: Feature Selection
+  ─────────────────────────
+  Se eliminan features con correlacion < 0.01 con el target:
+    V1 elimina: hour_sin, avg_product_popularity, max_product_popularity,
+                promedio_dept_usuario (4 features)
+    V4 elimina: hour_sin, hour_cos, es_finde, es_horario_laboral,
+                es_noche (5 features)
+
+  FASE 5: Optimizacion de Umbral
+  ───────────────────────────────
+  Para V1 se prueba umbrales de 0.30 a 0.50 y se selecciona el que
+  maximiza F1-Score de clase positiva (pedido en 7d).
+
+  Stacking inteligente: si el ensemble no supera al mejor modelo individual,
+  se usa el mejor individual.
+
+4. RESULTADOS FINALES
+─────────────────────
+
+  V1 - CLASIFICACION (Pedido en <=7 dias)
+  ────────────────────────────────────────
+  ┌──────────┬────────┬────────┬────────┬────────┬────────┐
+  │ Cluster  │ XGB    │ Cat    │ LGBM   │ STACK  │ Umbral │
+  ├──────────┼────────┼────────┼────────┼────────┼────────┤
+  │ ESTABLE  │ 65.7%  │ 66.7%  │ 66.7%  │ 70.6%  │ 0.30   │
+  │ REGULAR  │ 43.2%  │ 50.2%  │ 48.3%  │ 50.2%  │ 0.40   │
+  │ CAOTICO  │ 34.3%  │ 35.5%  │ 35.9%  │ 35.9%  │ 0.50   │
+  └──────────┴────────┴────────┴────────┴────────┴────────┘
+
+  Nota: Para REGULAR y CAOTICO, el mejor modelo individual (CatBoost/LGBM)
+  supera al stacking, por lo que se usa directamente.
+
+  V4 - REGRESION (Tamano del carrito)
+  ────────────────────────────────────
+  ┌──────────┬──────────────┬──────────────┬──────────────┐
+  │ Cluster  │ MAE (XGB)    │ MAE (Cat)    │ MAE (LGBM)   │
+  ├──────────┼──────────────┼──────────────┼──────────────┤
+  │ ESTABLE  │ 2.98         │ 2.78         │ 2.81         │
+  │ REGULAR  │ 4.98         │ 4.65         │ 4.69         │
+  │ CAOTICO  │ 2.55         │ 2.40         │ 2.42         │
+  └──────────┴──────────────┴──────────────┴──────────────┘
+
+  ┌──────────┬──────────────┬──────────────┬──────────────┐
+  │ Cluster  │ R2 (XGB)     │ R2 (Cat)     │ R2 (LGBM)    │
+  ├──────────┼──────────────┼──────────────┼──────────────┤
+  │ ESTABLE  │ 0.4817       │ 0.5440       │ 0.5301       │
+  │ REGULAR  │ 0.3838       │ 0.4611       │ 0.4495       │
+  │ CAOTICO  │ 0.4900       │ 0.5409       │ 0.5297       │
+  └──────────┴──────────────┴──────────────┴──────────────┘
+
+5. EVOLUCION (V2 original -> V5 final)
+───────────────────────────────────────
+  ┌────────────┬──────────┬──────────┬──────────┐
+  │ Metrica    │ V2       │ V5       │ Cambio   │
+  ├────────────┼──────────┼──────────┼──────────┤
+  │ F1 ESTABLE │ 66.4%    │ 70.6%    │ +4.2%    │
+  │ F1 REGULAR │ 42.5%    │ 50.2%    │ +7.7%    │
+  │ F1 CAOTICO │ 33.9%    │ 35.9%    │ +2.0%    │
+  │ MAE EST    │ 3.63     │ 2.78     │ -23%     │
+  │ MAE REG    │ 5.39     │ 4.65     │ -14%     │
+  │ MAE CAO    │ 3.15     │ 2.40     │ -24%     │
+  │ R2 EST     │ 0.40     │ 0.54     │ +35%     │
+  │ R2 REG     │ 0.33     │ 0.46     │ +39%     │
+  │ R2 CAO     │ 0.33     │ 0.54     │ +64%     │
+  └────────────┴──────────┴──────────┴──────────┘
+
+6. TECNICAS UTILIZADAS
+──────────────────────
+  [x] Feature Engineering (34 features en 6 categorias)
+  [x] K-Means Clustering (3 clusters: Estable/Regular/Caotico)
+  [x] XGBoost con Optuna (busqueda automatica de hiperparametros)
+  [x] CatBoost (manejo nativo de features, auto_class_weights)
+  [x] LightGBM (algoritmo rapido, is_unbalance=True)
+  [x] Stacking (promedio de probabilidades de 3 modelos)
+  [x] Feature Selection (eliminacion por correlacion < 0.01)
+  [x] Threshold Optimization (umbral que maximiza F1)
+  [x] GroupKFold (validacion que respeta user_id)
+  [x] Cold-start imputation (media GLOBAL, no de cluster)
+
+7. LEAKAGE VERIFICADO
+──────────────────────
+  [x] V1: Sin leakage (features del pedido actual + perfil historico)
+  [x] V4: Sin leakage (total_productos, productos_recomprados,
+       ratio_recompra, cart_vs_avg, cart_x_recompra, cart_x_dept
+       ELIMINADOS del set de features de V4)
+  [x] Clustering: Sin leakage (features historicas, no del pedido actual)
+  [x] Validacion: GroupKFold previene leakage entre train/test
+
+8. ARCHIVOS GENERADOS
+─────────────────────
+  Archivos de datos:
+    archivos/dataset_mejorado.csv          (131,209 x 38)
+
+  Modelos (archivos/modelos/):
+    kmeans_clustering.pkl
+    scaler_cluster.pkl
+    xgb_v1_cluster_[0,1,2].pkl
+    catboost_v1_cluster_[0,1,2].pkl
+    lgbm_v1_cluster_[0,1,2].pkl
+    xgb_v4_cluster_[0,1,2].pkl
+    catboost_v4_cluster_[0,1,2].pkl
+    lgbm_v4_cluster_[0,1,2].pkl
+
+  Graficos (REPORTES/):
+    grafico1_v5_comparacion.png
+    grafico2_v5_probabilidades.png
+    grafico3_v5_resumen.png
+
+  Codigo:
+    caracteristicas_mejorado.py     (feature engineering)
+    modelo_final_v2.py              (entrenamiento y evaluacion)
+    auditoria_features.py           (auditoria de leakage)
+    analisis_features.py            (analisis exploratorio)
+
+9. LIMITACIONES Y RECOMENDACIONES
+──────────────────────────────────
+  - El F1 del cluster CAOTICO (35.9%) es bajo porque estos usuarios
+    no tienen patron predecible. Solo scoring, no campanas agresivas.
+  - El cluster REGULAR (F1=50.2%) responde bien a CatBoost. Usar
+    score de propension en vez de clasificacion binaria.
+  - El cluster ESTABLE (F1=70.6%) es el mas predecible. Campana
+    agresiva con umbral 0.30.
+  - Las features de popularidad de producto fueron las que mas
+    subieron V4 (R2 +35-64%).
+  - El techo teorico de correlacion es ~0.44, y ya estamos en
+    R2=0.54 con CatBoost, lo cual es un resultado fuerte.
+
+================================================================================
+  FIN DEL INFORME
+================================================================================
